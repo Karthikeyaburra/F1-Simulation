@@ -21,7 +21,7 @@ import fastf1
 
 from data_pipeline import (
     SEASONS, fetch_and_clean_laps, aggregate_seasons_data,
-    driver_stints, starting_performance
+    driver_stints, starting_performance, normalize_team_name
 )
 from pit_stop_model import compute_team_pit_variability
 from probability_model import compute_probabilities
@@ -35,8 +35,11 @@ fastf1.Cache.enable_cache('../cache')
 # CONFIGURATION
 # ============================================================
 
-# Which GPs to use for parameter fitting
-FITTING_GPS = ['Bahrain']
+# Which GPs to use for parameter fitting (broad coverage across the calendar)
+FITTING_GPS = [
+    'Bahrain', 'Saudi Arabia', 'Australia', 'Japan',
+    'Miami', 'Spain', 'Great Britain', 'Italy'
+]
 
 # Which race to simulate
 SIM_YEAR = 2024
@@ -81,7 +84,7 @@ def get_race_entry_list(year: int, gp_name: str) -> list:
 
         entry_list.append({
             'abbreviation': row['Abbreviation'],
-            'team': row['TeamName'],
+            'team': normalize_team_name(row['TeamName']),
             'grid_pos': int(grid_pos),
         })
 
@@ -91,62 +94,167 @@ def get_race_entry_list(year: int, gp_name: str) -> list:
 def compute_car_driver_offsets(years: list, gps: list) -> dict:
     """Compute t_car (team offset) and t_driver (driver within team offset).
     
-    Uses median clean lap times to determine relative performance.
+    Normalizes team performance within each specific race session (Year + Track)
+    to prevent track-to-track base lap time variations from skewing the averages.
     """
     all_laps = aggregate_seasons_data(years, gps)
     if all_laps.empty:
         return {'t_car': {}, 't_driver': {}}
 
-    # Compute median lap time per team
-    team_medians = all_laps.groupby('Team')['LapTimeSeconds'].median()
-    fastest_team_median = team_medians.min()
-    t_car = (team_medians - fastest_team_median).to_dict()
-
-    # Compute driver offset within their team
-    driver_medians = all_laps.groupby(['Driver', 'Team'])['LapTimeSeconds'].median().reset_index()
-    driver_medians.columns = ['Driver', 'Team', 'MedianLap']
-
-    t_driver = {}
-    for _, row in driver_medians.iterrows():
-        team_median = team_medians.get(row['Team'], fastest_team_median)
-        t_driver[row['Driver']] = row['MedianLap'] - team_median
-
+    # Group by session to find relative offsets within each individual race
+    session_groups = all_laps.groupby(['Year', 'Track'])
+    
+    team_offsets_list = []
+    driver_offsets_list = []
+    
+    for session_key, session_data in session_groups:
+        # Team medians for this specific session
+        team_medians = session_data.groupby('Team')['LapTimeSeconds'].median()
+        fastest_team_median = team_medians.min()
+        session_team_offsets = team_medians - fastest_team_median
+        team_offsets_list.append(session_team_offsets)
+        
+        # Driver medians for this specific session
+        driver_medians = session_data.groupby(['Driver', 'Team'])['LapTimeSeconds'].median().reset_index()
+        for _, row in driver_medians.iterrows():
+            team_med = team_medians.get(row['Team'], fastest_team_median)
+            offset = row['LapTimeSeconds'] - team_med
+            driver_offsets_list.append({
+                'Driver': row['Driver'],
+                'Offset': offset
+            })
+            
+    # Combine and average team offsets across all sessions
+    team_offsets_df = pd.concat(team_offsets_list, axis=1).mean(axis=1)
+    t_car = team_offsets_df.to_dict()
+    
+    # Combine and average driver offsets across all sessions
+    driver_offsets_df = pd.DataFrame(driver_offsets_list)
+    if not driver_offsets_df.empty:
+        t_driver = driver_offsets_df.groupby('Driver')['Offset'].mean().to_dict()
+    else:
+        t_driver = {}
+    
     return {'t_car': t_car, 't_driver': t_driver}
 
 
 def estimate_tyre_degradation(years: list, gps: list) -> dict:
-    """Estimate tyre degradation rates per compound from stint data.
+    """Estimate tyre degradation parameters using a state-space model approach.
     
-    Uses the k1 coefficient from the quadratic polynomial fit as a 
-    proxy for linear degradation rate.
+    Fits:
+      - nu[compound]: degradation drift rate (seconds per lap)
+      - sigma_eta: process noise standard deviation (state transition uncertainty)
+      - sigma_eps: observation noise standard deviation (lap-by-lap pace variation)
+      - skewness: skewnorm shape parameter for asymmetric driver errors / traffic
+      
+    Returns:
+        dict: {
+            'degradation_rates': {compound: float},
+            'sigma_eta': float,
+            'sigma_eps': float,
+            'skewness': float
+        }
     """
     all_laps = aggregate_seasons_data(years, gps)
     if all_laps.empty:
-        return {'SOFT': 0.10, 'MEDIUM': 0.06, 'HARD': 0.03}
+        return {
+            'degradation_rates': {'SOFT': 0.10, 'MEDIUM': 0.06, 'HARD': 0.03},
+            'sigma_eta': 0.10,
+            'sigma_eps': 0.30,
+            'skewness': 1.5
+        }
 
-    compound_rates = {}
+    from scipy.stats import skewnorm
+
+    degradation_rates = {}
     stint_groups = all_laps.groupby(['Year', 'Track', 'Driver', 'Compound', 'Stint'])
+
+    # Fuel mass coefficient (from config, typical is 0.030 s/kg)
+    gamma = 0.030
+    # Average fuel consumption per lap (approx 1.93 kg/lap)
+    fuel_consumption = 1.93
+    m_fuel_start = 110.0
+
+    all_residuals = []
+    first_diff_residuals = []
 
     for compound in ['SOFT', 'MEDIUM', 'HARD']:
         rates = []
+        
         for stint_keys, stint_data in stint_groups:
             _, _, _, comp, _ = stint_keys
             if comp != compound or len(stint_data) < 5:
                 continue
-            x = stint_data['TyreLife'].values
-            y = stint_data['LapTimeSeconds'].values
-            k2, k1, k0 = np.polyfit(x, y, 2)
-            # k1 represents the linear degradation rate (s/lap)
-            if 0 < k1 < 1.0:  # Filter unreasonable values
-                rates.append(k1)
+            
+            # Stint age (t = 0, 1, 2...)
+            x = stint_data['TyreLife'].values - stint_data['TyreLife'].min()
+            
+            # Correct lap times for fuel effect:
+            laps = stint_data['LapNumber'].values
+            fuel_remaining = np.clip(m_fuel_start - fuel_consumption * (laps - 1), 0, m_fuel_start)
+            y_raw = stint_data['LapTimeSeconds'].values
+            y_fuel_corrected = y_raw - gamma * fuel_remaining
+            
+            # Fit linear model for tyre wear on fuel-corrected lap times
+            if len(x) >= 3:
+                k1, k0 = np.polyfit(x, y_fuel_corrected, 1)
+                
+                # Exclude outliers or negative rates
+                if 0.001 < k1 < 0.8:
+                    rates.append(k1)
+                    y_pred = k0 + k1 * x
+                    residuals = y_fuel_corrected - y_pred
+                    all_residuals.extend(residuals)
+                    
+                    if len(residuals) >= 2:
+                        first_diff_residuals.extend(np.diff(residuals))
 
         if rates:
-            compound_rates[compound] = np.median(rates)
+            degradation_rates[compound] = float(np.median(rates))
         else:
-            # Fallback defaults
-            compound_rates[compound] = {'SOFT': 0.10, 'MEDIUM': 0.06, 'HARD': 0.03}[compound]
+            degradation_rates[compound] = {'SOFT': 0.10, 'MEDIUM': 0.06, 'HARD': 0.03}[compound]
 
-    return compound_rates
+    # Now estimate state space noise parameters from residuals
+    sigma_eps = 0.30
+    sigma_eta = 0.10
+    skew_param = 1.5
+
+    if len(all_residuals) >= 10:
+        try:
+            # Use skewnorm to fit the residuals to capture the driver error / traffic skew
+            a_fit, loc_fit, scale_fit = skewnorm.fit(all_residuals)
+            skew_param = float(a_fit)
+            sigma_eps = float(scale_fit)
+        except Exception:
+            pass
+
+    if len(first_diff_residuals) >= 10:
+        try:
+            # Var(diff_residuals) = Var(eta) + 2 * Var(eps)
+            var_diff = np.var(first_diff_residuals)
+            cov_matrix = np.cov(first_diff_residuals[:-1], first_diff_residuals[1:])
+            cov_val = cov_matrix[0, 1] if cov_matrix.ndim > 1 else 0
+            
+            # Estimate sigma_eps^2 from -cov_val
+            est_var_eps = max(0.01, -cov_val)
+            est_var_eta = max(0.001, var_diff - 2 * est_var_eps)
+            
+            sigma_eps = float(np.sqrt(est_var_eps))
+            sigma_eta = float(np.sqrt(est_var_eta))
+        except Exception:
+            pass
+
+    # Ensure reasonable boundaries for simulation stability
+    sigma_eps = np.clip(sigma_eps, 0.15, 0.60)
+    sigma_eta = np.clip(sigma_eta, 0.02, 0.25)
+    skew_param = np.clip(skew_param, 0.5, 3.0)
+
+    return {
+        'degradation_rates': degradation_rates,
+        'sigma_eta': float(sigma_eta),
+        'sigma_eps': float(sigma_eps),
+        'skewness': float(skew_param)
+    }
 
 
 def assign_strategies(entry_list: list) -> list:
@@ -195,10 +303,13 @@ def run_full_simulation():
     print("\n[2/6] Section 3.2a - Fitting Lap Time Variability (Fisk)...")
     master_df = aggregate_seasons_data(SEASONS, FITTING_GPS)
     if not master_df.empty:
-        driver_fisk_params, _ = driver_stints(master_df)
+        stint_results = driver_stints(master_df)
+        driver_fisk_params = stint_results['driver_fisk_params']
+        track_fisk_params = stint_results['track_fisk_params']
         print(f"  Fisk parameters for {len(driver_fisk_params)} drivers")
     else:
         driver_fisk_params = {}
+        track_fisk_params = {}
 
     # --------------------------------------------------------
     # STEP 3: Section 3.2b - Pit Stop Variability
@@ -239,7 +350,8 @@ def run_full_simulation():
     print(f"  t_driver offsets for {len(t_driver)} drivers")
 
     print("\n  Estimating tyre degradation rates...")
-    tyre_deg = estimate_tyre_degradation(SEASONS, FITTING_GPS)
+    tyre_deg_data = estimate_tyre_degradation(SEASONS, FITTING_GPS)
+    tyre_deg = tyre_deg_data['degradation_rates']
     for compound, rate in tyre_deg.items():
         print(f"  {compound}: {rate:.4f} s/lap")
 
@@ -251,13 +363,14 @@ def run_full_simulation():
     # Assemble simulation parameters
     sim_params = {
         'driver_fisk_params': driver_fisk_params,
+        'track_fisk_params': track_fisk_params,
         'driver_start_params': driver_start_params,
         'team_pit_fisk_params': team_pit_fisk_params,
         'p_accident': p_accident,
         'p_failure': p_failure,
         'fcy_params': fcy_params,
         'a_avg_start': a_avg_fitted,
-        'tyre_degradation': tyre_deg,
+        'tyre_degradation': tyre_deg_data,
     }
 
     # Get the actual entry list for the target race

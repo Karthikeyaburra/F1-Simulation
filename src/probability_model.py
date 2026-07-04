@@ -39,7 +39,7 @@ FAILURE_KEYWORDS = [
 ]
 
 FINISHED_KEYWORDS = [
-    'finished', '+1 lap', '+2 laps', '+3 laps', '+4 laps',
+    'finished', 'lapped', '+1 lap', '+2 laps', '+3 laps', '+4 laps',
     '+5 laps', '+6 laps'
 ]
 
@@ -82,6 +82,9 @@ def fetch_race_results(year: int, gp_name: str) -> pd.DataFrame:
 
         results = session.results[['Abbreviation', 'TeamName', 'Status']].copy()
         results = results.rename(columns={'Abbreviation': 'Driver', 'TeamName': 'Team'})
+        # Normalize team names across seasons
+        from data_pipeline import normalize_team_name
+        results['Team'] = results['Team'].apply(normalize_team_name)
         results['Classification'] = results['Status'].apply(classify_retirement)
         results['Year'] = year
         results['GP'] = gp_name
@@ -94,20 +97,22 @@ def fetch_race_results(year: int, gp_name: str) -> pd.DataFrame:
 
 
 def build_historical_database(years: list, gps: list) -> dict:
-    """Build a historical database of accidents and failures across seasons.
+    """Build a historical database of accidents and failures grouped by Track Type.
     
     Returns:
         dict with keys:
-            'driver_accidents': {driver: {'races': int, 'accidents': int}}
-            'team_failures': {team: {'races': int, 'failures': int}}
-            'all_results': pd.DataFrame  (raw results for inspection)
+            'driver_accidents': {driver: {track_type: {'races': int, 'accidents': int}}}
+            'team_failures': {team: {track_type: {'races': int, 'failures': int}}}
+            'all_results': pd.DataFrame
     """
     all_results = []
+    from data_pipeline import get_track_type
 
     for year in years:
         for gp in gps:
             df = fetch_race_results(year, gp)
             if not df.empty:
+                df['TrackType'] = df['GP'].apply(get_track_type)
                 all_results.append(df)
 
     if not all_results:
@@ -116,20 +121,45 @@ def build_historical_database(years: list, gps: list) -> dict:
 
     combined = pd.concat(all_results, ignore_index=True)
 
-    # Per-driver accident stats
+    track_types = ['street', 'permanent', 'high-speed', 'All']
+
+    # Per-driver accident stats per track type
     driver_accidents = {}
     for driver, driver_data in combined.groupby('Driver'):
-        total_races = len(driver_data)
-        accidents = len(driver_data[driver_data['Classification'] == 'accident'])
-        driver_accidents[driver] = {'races': total_races, 'accidents': accidents}
+        driver_accidents[driver] = {tt: {'races': 0, 'accidents': 0} for tt in track_types}
+        
+        # Global stats
+        driver_accidents[driver]['All'] = {
+            'races': len(driver_data),
+            'accidents': len(driver_data[driver_data['Classification'] == 'accident'])
+        }
+        
+        # Track-type split stats
+        for tt in ['street', 'permanent', 'high-speed']:
+            sub = driver_data[driver_data['TrackType'] == tt]
+            driver_accidents[driver][tt] = {
+                'races': len(sub),
+                'accidents': len(sub[sub['Classification'] == 'accident'])
+            }
 
-    # Per-team failure stats (each driver entry counts as one race for the team)
+    # Per-team failure stats per track type
     team_failures = {}
     for team, team_data in combined.groupby('Team'):
-        # Count race entries (each driver in each race = 1 entry)
-        total_entries = len(team_data)
-        failures = len(team_data[team_data['Classification'] == 'failure'])
-        team_failures[team] = {'races': total_entries, 'failures': failures}
+        team_failures[team] = {tt: {'races': 0, 'failures': 0} for tt in track_types}
+        
+        # Global stats
+        team_failures[team]['All'] = {
+            'races': len(team_data),
+            'failures': len(team_data[team_data['Classification'] == 'failure'])
+        }
+        
+        # Track-type split stats
+        for tt in ['street', 'permanent', 'high-speed']:
+            sub = team_data[team_data['TrackType'] == tt]
+            team_failures[team][tt] = {
+                'races': len(sub),
+                'failures': len(sub[sub['Classification'] == 'failure'])
+            }
 
     return {
         'driver_accidents': driver_accidents,
@@ -138,56 +168,51 @@ def build_historical_database(years: list, gps: list) -> dict:
     }
 
 
-def compute_beta_prior(entity_stats: dict, event_key: str) -> tuple:
-    """Compute the Beta prior parameters (alpha_hat, beta_hat) from historical fractions.
-    
-    Args:
-        entity_stats: dict of {entity: {'races': int, event_key: int}}
-        event_key: 'accidents' or 'failures'
-    
-    Returns:
-        (alpha_hat, beta_hat) tuple
-    """
+def compute_beta_prior_for_type(entity_stats: dict, event_key: str, track_type: str) -> tuple:
+    """Compute the Beta prior parameters (alpha_hat, beta_hat) for a specific track type."""
     fractions = []
-    for entity, stats in entity_stats.items():
-        if stats['races'] >= 3:  # Minimum races threshold (relaxed from 30 for our smaller dataset)
+    for entity, stats_dict in entity_stats.items():
+        stats = stats_dict[track_type]
+        if stats['races'] >= 3:
             fraction = stats[event_key] / stats['races']
             fractions.append(fraction)
 
     if len(fractions) < 2:
-        print(f"Not enough data to compute prior for {event_key}")
-        return (1.0, 1.0)  # Uninformative prior
+        return (1.0, 10.0)  # Safe default prior (approx 9% DNF probability)
 
     fractions = np.array(fractions)
-    # Replace exact zeros with a small value to avoid division issues
     fractions = np.maximum(fractions, 0.001)
 
     mu_hat = np.mean(fractions)
     sigma_hat = np.std(fractions)
 
     if sigma_hat == 0 or mu_hat == 0:
-        return (1.0, 1.0)
+        return (1.0, 10.0)
 
     # Beta distribution method of moments (Paper's formula)
     alpha_hat = ((1 - mu_hat) / sigma_hat**2 - 1/mu_hat) * mu_hat**2
     beta_hat = alpha_hat * (1/mu_hat - 1)
 
-    # Ensure positive parameters
-    alpha_hat = max(alpha_hat, 0.1)
-    beta_hat = max(beta_hat, 0.1)
+    # Prevent prior dominance: cap the prior weight (equivalent sample size) at 10.0.
+    # This ensures driver/team data (typically N=10 to 24 races) can significantly update the posterior.
+    prior_weight = alpha_hat + beta_hat
+    max_prior_weight = 10.0
+    if prior_weight > max_prior_weight:
+        scale = max_prior_weight / prior_weight
+        alpha_hat *= scale
+        beta_hat *= scale
 
-    return (alpha_hat, beta_hat)
+    return (max(alpha_hat, 0.1), max(beta_hat, 0.1))
 
 
 def compute_probabilities(years: list, gps: list) -> dict:
-    """Compute accident and failure probabilities using Bayesian Beta-Bernoulli update.
+    """Compute track-type split accident and failure probabilities using Bayesian Beta-Bernoulli update.
     
     Returns:
-        dict with keys:
-            'p_accident': {driver: float}  (per-race probability)
-            'p_failure': {team: float}     (per-race probability)
-            'alpha_beta_accident': (alpha_hat, beta_hat)
-            'alpha_beta_failure': (alpha_hat, beta_hat)
+        dict: {
+            'p_accident': {driver: {track_type: float}},
+            'p_failure': {team: {track_type: float}}
+        }
     """
     db = build_historical_database(years, gps)
     if not db:
@@ -195,29 +220,63 @@ def compute_probabilities(years: list, gps: list) -> dict:
 
     driver_accidents = db['driver_accidents']
     team_failures = db['team_failures']
+    track_types = ['street', 'permanent', 'high-speed', 'All']
 
-    # Compute priors
-    alpha_a, beta_a = compute_beta_prior(driver_accidents, 'accidents')
-    alpha_f, beta_f = compute_beta_prior(team_failures, 'failures')
+    # Compute priors for all types
+    priors_accident = {}
+    priors_failure = {}
+    for tt in track_types:
+        priors_accident[tt] = compute_beta_prior_for_type(driver_accidents, 'accidents', tt)
+        priors_failure[tt] = compute_beta_prior_for_type(team_failures, 'failures', tt)
 
-    # Compute posterior means (per-race probabilities)
+    # Compute posteriors
     p_accident = {}
-    for driver, stats in driver_accidents.items():
-        z = stats['accidents']
-        N = stats['races']
-        p_accident[driver] = (alpha_a + z) / (alpha_a + beta_a + N)
+    for driver, stats_dict in driver_accidents.items():
+        p_accident[driver] = {}
+        # Pre-calculate global fallback posterior
+        alpha_g, beta_g = priors_accident['All']
+        z_g = stats_dict['All']['accidents']
+        N_g = stats_dict['All']['races']
+        global_posterior = (alpha_g + z_g) / (alpha_g + beta_g + N_g)
+
+        for tt in ['street', 'permanent', 'high-speed']:
+            stats = stats_dict[tt]
+            alpha, beta = priors_accident[tt]
+            z = stats['accidents']
+            N = stats['races']
+            
+            # If driver has less than 3 races on this track type, fall back to global
+            if N >= 3:
+                p_accident[driver][tt] = (alpha + z) / (alpha + beta + N)
+            else:
+                p_accident[driver][tt] = global_posterior
+        # Store global fallback
+        p_accident[driver]['All'] = global_posterior
 
     p_failure = {}
-    for team, stats in team_failures.items():
-        z = stats['failures']
-        N = stats['races']
-        p_failure[team] = (alpha_f + z) / (alpha_f + beta_f + N)
+    for team, stats_dict in team_failures.items():
+        p_failure[team] = {}
+        # Pre-calculate global fallback posterior
+        alpha_g, beta_g = priors_failure['All']
+        z_g = stats_dict['All']['failures']
+        N_g = stats_dict['All']['races']
+        global_posterior = (alpha_g + z_g) / (alpha_g + beta_g + N_g)
+
+        for tt in ['street', 'permanent', 'high-speed']:
+            stats = stats_dict[tt]
+            alpha, beta = priors_failure[tt]
+            z = stats['failures']
+            N = stats['races']
+            
+            if N >= 3:
+                p_failure[team][tt] = (alpha + z) / (alpha + beta + N)
+            else:
+                p_failure[team][tt] = global_posterior
+        p_failure[team]['All'] = global_posterior
 
     return {
         'p_accident': p_accident,
         'p_failure': p_failure,
-        'alpha_beta_accident': (alpha_a, beta_a),
-        'alpha_beta_failure': (alpha_f, beta_f),
         'database': db
     }
 

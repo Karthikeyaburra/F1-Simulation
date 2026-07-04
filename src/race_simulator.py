@@ -17,7 +17,9 @@ Core lap time equation (Equation 1):
 
 import numpy as np
 from scipy.stats import fisk as fisk_dist
+from scipy.stats import skewnorm
 from fcy_model import pre_determine_sc_phases
+from data_pipeline import get_track_type
 
 
 class DriverState:
@@ -29,7 +31,7 @@ class DriverState:
         self.grid_pos = grid_pos
         self.t_car = t_car
         self.t_driver = t_driver
-        self.fisk_params = fisk_params  # {'c', 'loc', 'scale'} for lap time variability
+        self.fisk_params = fisk_params  # Driver-specific Fisk dictionary (per track)
         self.start_perf = start_perf    # {'mu', 'sigma'} for starting performance
         self.strategy = strategy        # List of {'lap': int, 'compound': str}
 
@@ -38,6 +40,7 @@ class DriverState:
         self.lap_times = []
         self.current_compound = strategy[0]['compound'] if strategy else 'MEDIUM'
         self.tyre_age = 0
+        self.alpha = 0.0  # Latent tyre wear state (alpha_t in the state-space model)
         self.next_pit_idx = 1  # Index into strategy for next pit stop
         self.retired = False
         self.retired_lap = None
@@ -46,41 +49,16 @@ class DriverState:
 
 
 class RaceSimulator:
-    """Monte Carlo race simulator following Heilmeier et al. (2020)."""
+    """Monte Carlo race simulator incorporating advanced track-specific parameters."""
 
     def __init__(self, race_config: dict, sim_params: dict):
-        """
-        Args:
-            race_config: Dict containing race-specific parameters:
-                - total_laps: int
-                - t_base: float (base lap time = t_q + t_gap_racepace)
-                - t_lap_sens_mass: float (lap time sensitivity to fuel mass, s/kg)
-                - m_fuel_start: float (starting fuel mass in kg)
-                - b_fuel_perlap: float (fuel consumption per lap in kg)
-                - t_pit_stationary: float (minimum pit stop stationary time in s)
-                - t_pit_inlap: float (time loss entering pit lane in s)
-                - t_pit_outlap: float (time loss exiting pit lane in s)
-                - mult_t_lap_sc: float (lap time multiplier under SC, ~1.6)
-                - t_gap_overtake: float (required gap to overtake in s)
-                - t_drseffect: float (DRS lap time reduction in s, negative)
-                - drs_window: float (DRS activation window in s)
-                
-            sim_params: Dict containing fitted probabilistic parameters:
-                - driver_fisk_params: {driver: {'c', 'loc', 'scale'}}
-                - driver_start_params: {driver: {'mu', 'sigma'}}
-                - team_pit_fisk_params: {team: {'c', 'loc', 'scale', 'median_duration'}}
-                - p_accident: {driver: float}
-                - p_failure: {team: float}
-                - fcy_params: dict from compute_fcy_probabilities()
-                - a_avg_start: float (fitted start acceleration)
-                - tyre_degradation: {compound: float} (seconds per lap degradation)
-        """
         self.race_config = race_config
         self.sim_params = sim_params
         self.total_laps = race_config['total_laps']
+        self.track_name = race_config.get('track_name', 'Bahrain')
 
     def _compute_lap_time(self, driver: DriverState, lap: int, 
-                          is_sc: bool, rng: np.random.Generator) -> float:
+                           is_sc: bool, rng: np.random.Generator) -> float:
         """Compute the lap time for a single driver on a single lap."""
         rc = self.race_config
         sp = self.sim_params
@@ -92,28 +70,38 @@ class RaceSimulator:
         t_lap += driver.t_car
         t_lap += driver.t_driver
 
-        # Fuel effect: car gets lighter each lap (linear decrease)
+        # Fuel effect: delta from mid-race fuel load as reference
         fuel_remaining = max(0, rc['m_fuel_start'] - rc['b_fuel_perlap'] * (lap - 1))
-        t_fuel = rc['t_lap_sens_mass'] * fuel_remaining
+        fuel_at_midrace = rc['m_fuel_start'] - rc['b_fuel_perlap'] * (self.total_laps / 2)
+        t_fuel = rc['t_lap_sens_mass'] * (fuel_remaining - fuel_at_midrace)
         t_lap += t_fuel
 
-        # Tyre degradation: linear model per compound
-        tyre_deg_rate = sp.get('tyre_degradation', {}).get(driver.current_compound, 0.05)
-        t_tyre = tyre_deg_rate * driver.tyre_age
+        # Tyre degradation: state-space model base wear + process noise
+        tyre_degradation = sp.get('tyre_degradation', {})
+        degradation_rates = tyre_degradation.get('degradation_rates', {})
+        
+        if driver.tyre_age == 0:
+            driver.alpha = 0.0
+        else:
+            sigma_eta = tyre_degradation.get('sigma_eta', 0.10)
+            eta = rng.normal(0, sigma_eta)
+            nu = degradation_rates.get(driver.current_compound, 0.05)
+            driver.alpha += nu + eta
+
+        t_tyre = driver.alpha
         t_lap += t_tyre
 
         # Safety Car multiplier
         if is_sc:
             t_lap *= rc.get('mult_t_lap_sc', 1.6)
         else:
-            # Lap time variability (Fisk distribution) - only under green flag
-            if driver.fisk_params:
-                fp = driver.fisk_params
-                t_var = fisk_dist.rvs(fp['c'], loc=fp['loc'], scale=fp['scale'],
-                                      random_state=rng)
-                # Clamp extreme outliers
-                t_var = np.clip(t_var, -3.0, 10.0)
-                t_lap += t_var
+            # Lap time variability (asymmetric observation noise from paper)
+            skewness = tyre_degradation.get('skewness', 1.5)
+            sigma_eps = tyre_degradation.get('sigma_eps', 0.30)
+            
+            t_var = skewnorm.rvs(skewness, loc=0, scale=sigma_eps, random_state=rng)
+            t_var = np.clip(t_var, -1.0, 5.0)
+            t_lap += t_var
 
         return t_lap
 
@@ -123,12 +111,9 @@ class RaceSimulator:
         sp = self.sim_params
         a_avg = sp.get('a_avg_start', 11.2)
         
-        # Deterministic component: time to reach start line from grid position
-        # t_s = sqrt(16 * (p_g - 0.8) / a_avg) + 0.2
         grid_pos = driver.grid_pos
         t_start = np.sqrt(16.0 * max(0.2, grid_pos - 0.8) / a_avg) + 0.2
 
-        # Stochastic component: driver-specific start performance
         if driver.start_perf:
             t_startperf = rng.normal(driver.start_perf['mu'], 
                                      max(0.01, driver.start_perf['sigma']))
@@ -149,23 +134,26 @@ class RaceSimulator:
         rc = self.race_config
         sp = self.sim_params
 
-        # Base pit time
-        t_pit = rc['t_pit_inlap'] + rc['t_pit_stationary'] + rc['t_pit_outlap']
-
-        # Add team-specific pit stop variability (Fisk distribution)
+        # Base pit time from track-specific team statistics or config fallback
         team_pit_params = sp.get('team_pit_fisk_params', {}).get(driver.team, None)
         if team_pit_params:
+            t_pit = team_pit_params['medians'].get(self.track_name, team_pit_params['global_median'])
+            
+            # Add crew variability
             t_pit_var = fisk_dist.rvs(team_pit_params['c'],
                                        loc=team_pit_params['loc'],
                                        scale=team_pit_params['scale'],
                                        random_state=rng)
             t_pit_var = np.clip(t_pit_var, -2.0, 15.0)
             t_pit += t_pit_var
+        else:
+            t_pit = rc['t_pit_inlap'] + rc['t_pit_stationary'] + rc['t_pit_outlap']
 
         # Switch tyres
         new_compound = driver.strategy[driver.next_pit_idx]['compound']
         driver.current_compound = new_compound
         driver.tyre_age = 0
+        driver.alpha = 0.0  # Reset tyre wear state space state
         driver.next_pit_idx += 1
 
         return t_pit
@@ -174,11 +162,14 @@ class RaceSimulator:
                           rng: np.random.Generator) -> bool:
         """Check if driver retires this lap due to accident or failure."""
         sp = self.sim_params
+        track_type = get_track_type(self.track_name)
 
-        # Convert per-race probability to per-lap probability:
-        # P_per_lap = 1 - (1 - P_per_race)^(1/total_laps)
-        p_accident_race = sp.get('p_accident', {}).get(driver.abbreviation, 0.05)
-        p_failure_race = sp.get('p_failure', {}).get(driver.team, 0.05)
+        # Retrieve track-type specific probabilities or global fallback
+        driver_acc_dict = sp.get('p_accident', {}).get(driver.abbreviation, {})
+        p_accident_race = driver_acc_dict.get(track_type, driver_acc_dict.get('All', 0.05))
+
+        team_fail_dict = sp.get('p_failure', {}).get(driver.team, {})
+        p_failure_race = team_fail_dict.get(track_type, team_fail_dict.get('All', 0.05))
 
         p_accident_lap = 1 - (1 - p_accident_race) ** (1 / self.total_laps)
         p_failure_lap = 1 - (1 - p_failure_race) ** (1 / self.total_laps)
