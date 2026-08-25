@@ -47,7 +47,6 @@ Furthermore, the simulator is structured as a **custom Gymnasium-compatible Rein
 
 ### Core Lap Time Equation (Heilmeier et al., Eq. 1)
 
-$$t_{\text{lap}}(l) = t_{\text{base}} + t_{\text{car}} + t_{\text{driver}} + t_{\text{fuel}}(l) + t_{\text{tyre}}(a, c) + t_{\text{grid}}(l) + t_{\text{pit}}(l) + t_{\text{var}}$$
 
 Where:
 * **Fuel Effect**: $t_{\text{fuel}}(l) = \gamma_{\text{mass}} \cdot (m_{\text{fuel}}(l) - m_{\text{mid}})$
