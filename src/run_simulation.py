@@ -27,6 +27,7 @@ from pit_stop_model import compute_team_pit_variability
 from probability_model import compute_probabilities
 from fcy_model import compute_fcy_probabilities
 from race_simulator import RaceSimulator
+from track_configs import TRACK_CONFIGS, get_race_config
 
 fastf1.Cache.enable_cache('../cache')
 
@@ -48,22 +49,9 @@ SIM_GP = 'Bahrain'
 # Monte Carlo iterations
 N_ITERATIONS = 500
 
-# Race configuration for Bahrain 2024
-# (These values are track-specific; sourced from the paper's approach)
-RACE_CONFIG = {
-    'total_laps': 57,
-    't_base': 93.0,              # Approximate base lap time (qualifying + race pace gap)
-    't_lap_sens_mass': 0.030,    # Lap time sensitivity to fuel mass (s/kg)
-    'm_fuel_start': 110.0,       # Starting fuel mass (kg)
-    'b_fuel_perlap': 1.93,       # Fuel consumption per lap (kg/lap)
-    't_pit_stationary': 2.5,     # Minimum pit stop stationary time (s)
-    't_pit_inlap': 3.0,          # Pit entry time loss (s)
-    't_pit_outlap': 18.0,        # Pit exit time loss (s)
-    'mult_t_lap_sc': 1.6,        # SC lap time multiplier
-    't_gap_overtake': 1.5,       # Required time gap to overtake (s)
-    't_drseffect': -0.4,         # DRS effect on lap time (s)
-    'drs_window': 1.0,           # DRS activation window (s)
-}
+# Default race configuration (Bahrain) — kept for backward compatibility
+# Use get_race_config(gp_name) for track-specific configs
+RACE_CONFIG = get_race_config('Bahrain')
 
 
 def get_race_entry_list(year: int, gp_name: str) -> list:
@@ -257,15 +245,20 @@ def estimate_tyre_degradation(years: list, gps: list) -> dict:
     }
 
 
-def assign_strategies(entry_list: list) -> list:
+def assign_strategies(entry_list: list, total_laps: int = 57) -> list:
     """Assign default 1-stop strategies to all drivers.
     
     This is a simplification - the paper's full version optimizes strategies.
-    Here we use a standard Medium -> Hard strategy with pit around lap 20.
+    Pit stop window scales with total race laps (~35% race distance).
     """
+    pit_window_center = max(10, int(total_laps * 0.35))
+    pit_window_half = 2
+    
     for driver in entry_list:
-        # Default 1-stop: start on MEDIUM, pit around lap 18-22, switch to HARD
-        pit_lap = np.random.randint(18, 23)
+        pit_lap = np.random.randint(
+            pit_window_center - pit_window_half,
+            pit_window_center + pit_window_half + 1
+        )
         driver['strategy'] = [
             {'lap': 1, 'compound': 'MEDIUM'},
             {'lap': pit_lap, 'compound': 'HARD'}
@@ -384,8 +377,10 @@ def run_full_simulation():
     # Assign strategies
     entry_list = assign_strategies(entry_list)
 
-    # Create simulator and run
-    simulator = RaceSimulator(RACE_CONFIG, sim_params)
+    # Create simulator and run with track-specific config
+    race_config = get_race_config(SIM_GP)
+    race_config['track_name'] = SIM_GP
+    simulator = RaceSimulator(race_config, sim_params)
     mc_results = simulator.monte_carlo(entry_list, n_iterations=N_ITERATIONS)
 
     # --------------------------------------------------------

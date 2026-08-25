@@ -1,0 +1,9 @@
+{
+  "race": "Bahrain 2024",
+  "mae": 2.8101999999999996,
+  "winner_prediction_confidence": 0.618,
+  "top10_accuracy": "8/10",
+  "actual_dnfs": 0,
+  "simulated_expected_dnfs": 2.208,
+  "actual_safety_cars": 0
+}

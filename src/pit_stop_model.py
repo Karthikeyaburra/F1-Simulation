@@ -40,7 +40,11 @@ def extract_pit_stops(year: int, gp_name: str) -> pd.DataFrame:
         # Filter out unreasonable pit stops (< 10s likely data error, > 60s likely red flag/issue)
         pit_laps = pit_laps[(pit_laps['PitDuration'] > 10) & (pit_laps['PitDuration'] < 60)]
 
-        return pit_laps[['Driver', 'Team', 'PitDuration']].copy()
+        result = pit_laps[['Driver', 'Team', 'PitDuration']].copy()
+        # Normalize team names across seasons
+        from data_pipeline import normalize_team_name
+        result['Team'] = result['Team'].apply(normalize_team_name)
+        return result
 
     except Exception as e:
         print(f"Error extracting pit stops for {gp_name} {year}: {e}")
@@ -48,16 +52,22 @@ def extract_pit_stops(year: int, gp_name: str) -> pd.DataFrame:
 
 
 def compute_team_pit_variability(years: list, gps: list) -> dict:
-    """Compute Fisk distribution parameters for pit stop variability per team.
+    """Compute Fisk distribution parameters for pit stop variability per team and track.
     
     For each team, we:
-    1. Collect all pit stop durations across the specified races
-    2. Compute the team's median pit duration as the baseline
-    3. Calculate the deviation: pit_var = actual_duration - team_median
-    4. Fit a Fisk distribution to these deviations
+    1. Collect all pit stop durations across the specified races/tracks
+    2. Compute the team's median pit duration per track: median_duration[Team][Track]
+    3. Calculate the deviation: deviation = PitDuration - median_duration[Team][Track]
+    4. Fit a Fisk distribution to these deviations pooled across all tracks
     
     Returns:
-        dict: {team_name: {'c': float, 'loc': float, 'scale': float, 'median_duration': float}}
+        dict: {
+            team_name: {
+                'c': float, 'loc': float, 'scale': float,
+                'medians': {track: float},
+                'global_median': float
+            }
+        }
     """
     all_pit_stops = []
 
@@ -65,6 +75,7 @@ def compute_team_pit_variability(years: list, gps: list) -> dict:
         for gp in gps:
             df = extract_pit_stops(year, gp)
             if not df.empty:
+                df['Track'] = gp
                 all_pit_stops.append(df)
 
     if not all_pit_stops:
@@ -75,22 +86,36 @@ def compute_team_pit_variability(years: list, gps: list) -> dict:
 
     team_fisk_params = {}
     for team, team_data in combined.groupby('Team'):
-        durations = team_data['PitDuration'].values
-        if len(durations) < 5:
+        # 1. Compute track-specific medians
+        track_medians = {}
+        for track, track_data in team_data.groupby('Track'):
+            track_medians[track] = float(np.median(track_data['PitDuration'].values))
+            
+        global_median = float(np.median(team_data['PitDuration'].values))
+        
+        # 2. Compute deviations using track-specific baselines
+        deviations = []
+        for _, row in team_data.iterrows():
+            track = row['Track']
+            duration = row['PitDuration']
+            med = track_medians.get(track, global_median)
+            deviations.append(duration - med)
+            
+        deviations = np.array(deviations)
+        if len(deviations) < 5:
             continue
-
-        median_duration = np.median(durations)
-        # Compute deviations from the team's median pit time
-        deviations = durations - median_duration
 
         try:
             c, loc, scale = fisk.fit(deviations)
             team_fisk_params[team] = {
-                'c': c, 'loc': loc, 'scale': scale,
-                'median_duration': median_duration
+                'c': float(c),
+                'loc': float(loc),
+                'scale': float(scale),
+                'medians': track_medians,
+                'global_median': global_median
             }
         except Exception as e:
-            print(f"Could not fit Fisk for team {team}: {e}")
+            pass
 
     return team_fisk_params
 

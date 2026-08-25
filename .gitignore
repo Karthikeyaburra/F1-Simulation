@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+venv/
+env/
+ENV/
+
+# Cache directories
+cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+.vite/
+
+# Build outputs
+frontend/dist/
+frontend/build/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Output artifacts & logs
+*.log

@@ -7,7 +7,60 @@ import matplotlib.pyplot as plt
 
 fastf1.Cache.enable_cache('../cache')
 
-SEASONS = [2023, 2024, 2025]
+SEASONS = [2022, 2023, 2024, 2025]
+
+# Circuit classifications for DNF probability splits
+TRACK_CLASSIFICATIONS = {
+    'Bahrain': 'permanent',
+    'Saudi Arabia': 'street',
+    'Australia': 'street',
+    'Japan': 'permanent',
+    'Miami': 'street',
+    'Monaco': 'street',
+    'Spain': 'permanent',
+    'Canada': 'street',
+    'Austria': 'permanent',
+    'Great Britain': 'high-speed',
+    'Hungary': 'permanent',
+    'Belgium': 'high-speed',
+    'Netherlands': 'permanent',
+    'Italy': 'high-speed',
+    'Singapore': 'street',
+    'Japan': 'permanent',
+    'Qatar': 'permanent',
+    'United States': 'permanent',
+    'Mexico': 'permanent',
+    'Brazil': 'permanent',
+    'Las Vegas': 'street',
+    'Abu Dhabi': 'permanent',
+    'Azerbaijan': 'street',
+    'Emilia Romagna': 'permanent',
+    'China': 'permanent'
+}
+
+def get_track_type(gp_name: str) -> str:
+    """Return 'street', 'permanent', or 'high-speed' circuit type."""
+    return TRACK_CLASSIFICATIONS.get(gp_name, 'permanent')
+
+# Canonical team name mapping to handle renames across seasons
+TEAM_NAME_MAP = {
+    'Alfa Romeo': 'Kick Sauber',
+    'Alfa Romeo Racing': 'Kick Sauber',
+    'AlphaTauri': 'RB',
+    'Scuderia AlphaTauri': 'RB',
+    'Alpine F1 Team': 'Alpine',
+    'Aston Martin Racing': 'Aston Martin',
+    'Red Bull Racing': 'Red Bull Racing',
+    'McLaren': 'McLaren',
+    'Ferrari': 'Ferrari',
+    'Mercedes': 'Mercedes',
+    'Williams': 'Williams',
+    'Haas F1 Team': 'Haas F1 Team',
+}
+
+def normalize_team_name(name: str) -> str:
+    """Map historical team names to their current canonical name."""
+    return TEAM_NAME_MAP.get(name, name)
 
 def fetch_and_clean_laps(year: int, gp_name: str) -> pd.DataFrame:
     try:
@@ -29,6 +82,7 @@ def fetch_and_clean_laps(year: int, gp_name: str) -> pd.DataFrame:
 
         clean_laps['Year'] = year
         clean_laps['Track'] = gp_name
+        clean_laps['Team'] = clean_laps['Team'].apply(normalize_team_name)
         
         return clean_laps
 
@@ -52,7 +106,11 @@ def aggregate_seasons_data(years: list, gps:list) -> pd.DataFrame:
         return pd.DataFrame()
 
 def driver_stints(df: pd.DataFrame):
+    # driver_residuals[driver][track] = list of residuals
+    # driver_residuals[driver]['All'] = list of residuals (across all tracks)
+    # track_residuals[track] = list of residuals (across all drivers)
     driver_residuals = {}
+    track_residuals = {}
 
     stint_groups = df.groupby(['Year', 'Track', 'Driver', 'Compound', 'Stint'])
 
@@ -65,26 +123,54 @@ def driver_stints(df: pd.DataFrame):
         x = stint_data['TyreLife'].values
         y = stint_data['LapTimeSeconds'].values
 
+        # Fitting stint polynomial to extract residuals
         k2, k1, k0 = np.polyfit(x, y, 2)
-
         y_pred = k2*(x**2) + k1*x + k0
-
         residuals = y - y_pred
 
+        # Driver specific
         if driver not in driver_residuals:
-            driver_residuals[driver] = []
-        driver_residuals[driver].extend(residuals)
+            driver_residuals[driver] = {'All': []}
+        if track not in driver_residuals[driver]:
+            driver_residuals[driver][track] = []
+        driver_residuals[driver][track].extend(residuals)
+        driver_residuals[driver]['All'].extend(residuals)
 
+        # Track specific
+        if track not in track_residuals:
+            track_residuals[track] = []
+        track_residuals[track].extend(residuals)
+
+    # Fit Fisk distributions
     driver_fisk_params = {}
-    for driver, residuals_list in driver_residuals.items():
-        residuals_arr = np.array(residuals_list)
-        if len(residuals_arr) < 10:
-            continue
-        # Fit the Fisk (log-logistic) distribution to the residuals
-        c, loc, scale = fisk.fit(residuals_arr)
-        driver_fisk_params[driver] = {'c': c, 'loc': loc, 'scale': scale}
-        
-    return driver_fisk_params, driver_residuals
+    
+    # Format: driver_fisk_params[driver][track] = {'c', 'loc', 'scale'}
+    for driver, track_dict in driver_residuals.items():
+        driver_fisk_params[driver] = {}
+        for trk, res_list in track_dict.items():
+            res_arr = np.array(res_list)
+            # Require at least 15 laps to fit a driver-track Fisk distribution
+            if len(res_arr) >= 15:
+                try:
+                    c, loc, scale = fisk.fit(res_arr)
+                    driver_fisk_params[driver][trk] = {'c': float(c), 'loc': float(loc), 'scale': float(scale)}
+                except Exception as e:
+                    pass
+
+    track_fisk_params = {}
+    for trk, res_list in track_residuals.items():
+        res_arr = np.array(res_list)
+        if len(res_arr) >= 15:
+            try:
+                c, loc, scale = fisk.fit(res_arr)
+                track_fisk_params[trk] = {'c': float(c), 'loc': float(loc), 'scale': float(scale)}
+            except Exception as e:
+                pass
+
+    return {
+        'driver_fisk_params': driver_fisk_params,
+        'track_fisk_params': track_fisk_params
+    }
 
 def starting_performance(years, gps):
     grid_positions = []

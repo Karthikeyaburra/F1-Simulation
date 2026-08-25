@@ -231,6 +231,13 @@ def pre_determine_sc_phases(fcy_params: dict, total_laps: int, rng: np.random.Ge
     if n_sc == 0:
         return []
 
+    # Fallback: if start or duration distributions are all zeros (no historical data),
+    # use uniform distributions instead of crashing
+    if sum(p_sc_start) == 0:
+        p_sc_start = [1/6] * 6
+    if sum(p_sc_duration) == 0:
+        p_sc_duration = [1/10] * 10
+
     sc_phases = []
     for _ in range(n_sc):
         # Determine which bin the SC starts in
@@ -243,7 +250,6 @@ def pre_determine_sc_phases(fcy_params: dict, total_laps: int, rng: np.random.Ge
             # Map bin to lap range
             bin_start = (bin_idx - 1) * 0.2 if bin_idx > 0 else 0
             bin_end = bin_idx * 0.2 if bin_idx < 5 else 1.0
-            # For bin_idx=1: laps in [0, 20%) of race, etc.
             lap_start = max(2, int(bin_start * total_laps))
             lap_end = int(bin_end * total_laps)
             start_lap = rng.integers(lap_start, max(lap_start + 1, lap_end))
@@ -258,7 +264,20 @@ def pre_determine_sc_phases(fcy_params: dict, total_laps: int, rng: np.random.Ge
 
     # Sort by start lap
     sc_phases.sort(key=lambda x: x['start_lap'])
-    return sc_phases
+
+    # Merge overlapping SC phases
+    merged = [sc_phases[0]]
+    for phase in sc_phases[1:]:
+        prev = merged[-1]
+        prev_end = prev['start_lap'] + prev['duration']
+        if phase['start_lap'] <= prev_end:
+            # Overlap detected — extend the previous phase
+            new_end = max(prev_end, phase['start_lap'] + phase['duration'])
+            prev['duration'] = new_end - prev['start_lap']
+        else:
+            merged.append(phase)
+
+    return merged
 
 
 if __name__ == "__main__":

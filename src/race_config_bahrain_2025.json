@@ -1,0 +1,346 @@
+{
+  "year": 2025,
+  "gp_name": "Bahrain",
+  "drivers": [
+    {
+      "abbreviation": "PIA",
+      "team": "McLaren",
+      "grid_pos": 1,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 20,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 0.019812500000000455,
+      "t_driver": -0.020124999999998394
+    },
+    {
+      "abbreviation": "RUS",
+      "team": "Mercedes",
+      "grid_pos": 3,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 19,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 0.824812500000002,
+      "t_driver": -0.1925624999999993
+    },
+    {
+      "abbreviation": "NOR",
+      "team": "McLaren",
+      "grid_pos": 6,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 20,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 0.019812500000000455,
+      "t_driver": -0.0381874999999976
+    },
+    {
+      "abbreviation": "LEC",
+      "team": "Ferrari",
+      "grid_pos": 2,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 19,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 0.8608125000000051,
+      "t_driver": -0.17850000000000144
+    },
+    {
+      "abbreviation": "HAM",
+      "team": "Ferrari",
+      "grid_pos": 9,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 21,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 0.8608125000000051,
+      "t_driver": 0.1688124999999978
+    },
+    {
+      "abbreviation": "VER",
+      "team": "Red Bull Racing",
+      "grid_pos": 7,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 20,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 0.4831250000000029,
+      "t_driver": -0.1920000000000012
+    },
+    {
+      "abbreviation": "GAS",
+      "team": "Alpine",
+      "grid_pos": 4,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 19,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.7676875000000027,
+      "t_driver": -0.15421428571428716
+    },
+    {
+      "abbreviation": "OCO",
+      "team": "Haas F1 Team",
+      "grid_pos": 14,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 20,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.8471875000000004,
+      "t_driver": -0.1292499999999972
+    },
+    {
+      "abbreviation": "TSU",
+      "team": "Red Bull Racing",
+      "grid_pos": 10,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 20,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 0.4831250000000029,
+      "t_driver": 0.3047142857142851
+    },
+    {
+      "abbreviation": "BEA",
+      "team": "Haas F1 Team",
+      "grid_pos": 20,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 19,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.8471875000000004,
+      "t_driver": 0.13762500000000166
+    },
+    {
+      "abbreviation": "ANT",
+      "team": "Mercedes",
+      "grid_pos": 5,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 20,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 0.824812500000002,
+      "t_driver": 0.2392857142857159
+    },
+    {
+      "abbreviation": "ALB",
+      "team": "Williams",
+      "grid_pos": 15,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 21,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.353687500000003,
+      "t_driver": -0.12968750000000462
+    },
+    {
+      "abbreviation": "HAD",
+      "team": "Racing Bulls",
+      "grid_pos": 12,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 22,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.742250000000002,
+      "t_driver": -0.3525714285714311
+    },
+    {
+      "abbreviation": "DOO",
+      "team": "Alpine",
+      "grid_pos": 11,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 21,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.7676875000000027,
+      "t_driver": 0.09000000000000341
+    },
+    {
+      "abbreviation": "ALO",
+      "team": "Aston Martin",
+      "grid_pos": 13,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 19,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.6816875000000042,
+      "t_driver": -0.12371428571428973
+    },
+    {
+      "abbreviation": "LAW",
+      "team": "Racing Bulls",
+      "grid_pos": 17,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 22,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.742250000000002,
+      "t_driver": 0.16474999999999795
+    },
+    {
+      "abbreviation": "STR",
+      "team": "Aston Martin",
+      "grid_pos": 19,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 20,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.6816875000000042,
+      "t_driver": 0.11235714285713934
+    },
+    {
+      "abbreviation": "BOR",
+      "team": "Kick Sauber",
+      "grid_pos": 18,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 22,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.5383125000000035,
+      "t_driver": 0.027937499999998394
+    },
+    {
+      "abbreviation": "SAI",
+      "team": "Williams",
+      "grid_pos": 8,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 19,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.353687500000003,
+      "t_driver": 0.15049999999999622
+    },
+    {
+      "abbreviation": "HUL",
+      "team": "Kick Sauber",
+      "grid_pos": 16,
+      "strategy": [
+        {
+          "lap": 1,
+          "compound": "MEDIUM"
+        },
+        {
+          "lap": 21,
+          "compound": "HARD"
+        }
+      ],
+      "t_car": 1.5383125000000035,
+      "t_driver": 0.03792857142856982
+    }
+  ]
+}

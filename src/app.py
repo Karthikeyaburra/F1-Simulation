@@ -1,28 +1,38 @@
 """
-FastAPI Backend Application
-===========================
-Serves APIs for the React frontend:
-- GET /api/config: Returns available tracks, seasons, and baseline drivers
-- GET /api/analytics: Returns fitted Fisk and starting performance parameters
-- POST /api/simulate: Runs the Monte Carlo simulation and returns results
+FastAPI Backend Application — Production
+=========================================
+Full-featured API server for the F1 Monte Carlo Strategy Simulator.
+
+Endpoints:
+    GET  /api/config          — Race entry list and driver configurations
+    GET  /api/analytics       — Fitted parameter distributions for charts
+    GET  /api/tracks          — Available tracks with their configs
+    POST /api/simulate        — Run Monte Carlo simulation (batch)
+    WS   /ws/simulate         — WebSocket streaming Monte Carlo simulation
+    POST /api/simulate/rl     — Run RL-optimized strategy comparison
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import pandas as pd
 import numpy as np
 import json
 import os
+import asyncio
 
 from data_pipeline import SEASONS, starting_performance, aggregate_seasons_data, driver_stints
 from pit_stop_model import compute_team_pit_variability
 from probability_model import compute_probabilities
 from fcy_model import compute_fcy_probabilities
-from race_simulator import RaceSimulator
-from run_simulation import get_race_entry_list, compute_car_driver_offsets, estimate_tyre_degradation, assign_strategies, RACE_CONFIG
+from race_simulator import RaceSimulator, DriverState
+from run_simulation import get_race_entry_list, compute_car_driver_offsets, estimate_tyre_degradation, assign_strategies
+from track_configs import TRACK_CONFIGS, get_race_config, get_available_tracks
 
-app = FastAPI(title="F1 Monte Carlo Simulation API")
+app = FastAPI(
+    title="F1 Monte Carlo Strategy Simulator API",
+    description="Production-grade API for F1 race strategy optimization using Monte Carlo simulation and Reinforcement Learning",
+    version="2.0.0"
+)
 
 # Enable CORS for frontend development
 app.add_middleware(
@@ -33,6 +43,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ====================
+# Pydantic Models
+# ====================
 
 class StintSelection(BaseModel):
     lap: int
@@ -55,7 +69,18 @@ class SimulationRequest(BaseModel):
     drivers: list[DriverStrategyConfig]
 
 
-# Global caches loaded at startup, keyed by year
+class RLRequest(BaseModel):
+    year: int
+    gp_name: str
+    driver_abbreviation: str
+    n_training_episodes: int = 3000
+    drivers: list[DriverStrategyConfig]
+
+
+# ====================
+# Global Caches
+# ====================
+
 FITTED_PARAMS = {}
 PRE_RACE_CONFIG = {}
 
@@ -97,7 +122,10 @@ def migrate_tyre_degradation_params(tyre_deg: dict) -> dict:
     return tyre_deg
 
 
-# Load static assets for all seasons immediately on startup
+# ====================
+# Startup Data Loading
+# ====================
+
 for yr in SEASONS:
     params_file = f'fitted_parameters_{yr}.json'
     config_file = f'race_config_bahrain_{yr}.json'
@@ -208,17 +236,36 @@ def load_all_fitted_parameters(year: int):
     return FITTED_PARAMS[year]
 
 
+# ====================
+# API Endpoints
+# ====================
+
+@app.get("/api/tracks")
+async def get_tracks():
+    """Return available tracks with their configurations."""
+    tracks = []
+    for name, config in TRACK_CONFIGS.items():
+        tracks.append({
+            "name": name,
+            "total_laps": config['total_laps'],
+            "t_base": config['t_base'],
+        })
+    return {"tracks": tracks}
+
+
 @app.get("/api/config")
 async def get_config(year: int = 2024, gp_name: str = "Bahrain"):
     """Get the initial entry list and configurations for the race."""
     try:
-        # Serve immediately from memory if available for target year
+        track_config = get_race_config(gp_name)
+        
+        # Serve immediately from memory if available for target year + Bahrain baseline
         if year in PRE_RACE_CONFIG:
             stored = PRE_RACE_CONFIG[year]
             return {
                 "year": stored["year"],
-                "gp_name": stored["gp_name"],
-                "laps": RACE_CONFIG['total_laps'],
+                "gp_name": gp_name,
+                "laps": track_config['total_laps'],
                 "drivers": stored["drivers"],
                 "compounds": ["SOFT", "MEDIUM", "HARD"]
             }
@@ -227,7 +274,7 @@ async def get_config(year: int = 2024, gp_name: str = "Bahrain"):
         print(f"Asset missing: dynamically loading race config for {year}...")
         params = load_all_fitted_parameters(year)
         entries = get_race_entry_list(year, gp_name)
-        entries = assign_strategies(entries)
+        entries = assign_strategies(entries, track_config['total_laps'])
         for driver in entries:
             driver['t_car'] = params['t_car'].get(driver['team'], 0.5)
             driver['t_driver'] = params['t_driver'].get(driver['abbreviation'], 0.0)
@@ -235,7 +282,7 @@ async def get_config(year: int = 2024, gp_name: str = "Bahrain"):
         return {
             "year": year,
             "gp_name": gp_name,
-            "laps": RACE_CONFIG['total_laps'],
+            "laps": track_config['total_laps'],
             "drivers": entries,
             "compounds": ["SOFT", "MEDIUM", "HARD"]
         }
@@ -253,7 +300,8 @@ async def get_analytics(year: int = 2024):
             "tyre_degradation": params['tyre_degradation'],
             "driver_start_params": params['driver_start_params'],
             "driver_fisk_params": params['driver_fisk_params'],
-            "team_pit_fisk_params": params['team_pit_fisk_params']
+            "team_pit_fisk_params": params['team_pit_fisk_params'],
+            "fcy_params": params.get('fcy_params', {}),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -261,7 +309,7 @@ async def get_analytics(year: int = 2024):
 
 @app.post("/api/simulate")
 async def simulate(req: SimulationRequest):
-    """Execute the Monte Carlo simulation."""
+    """Execute the Monte Carlo simulation (batch mode)."""
     try:
         params = load_all_fitted_parameters(req.year)
         
@@ -277,10 +325,10 @@ async def simulate(req: SimulationRequest):
                 'strategy': [{'lap': s.lap, 'compound': s.compound} for s in d.strategy]
             })
 
-        # Run simulator
-        config_with_track = RACE_CONFIG.copy()
-        config_with_track['track_name'] = req.gp_name
-        simulator = RaceSimulator(config_with_track, params)
+        # Run simulator with track-specific config
+        track_config = get_race_config(req.gp_name)
+        track_config['track_name'] = req.gp_name
+        simulator = RaceSimulator(track_config, params)
         mc_results = simulator.monte_carlo(driver_configs, n_iterations=req.n_iterations)
 
         # Convert numpy arrays to standard lists for JSON output
@@ -295,6 +343,208 @@ async def simulate(req: SimulationRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/ws/simulate")
+async def websocket_simulate(websocket: WebSocket):
+    """WebSocket endpoint for streaming Monte Carlo simulation progress.
+    
+    Client sends JSON: {year, gp_name, n_iterations, drivers: [...]}
+    Server sends JSON updates every batch of iterations:
+        {type: "progress", iteration, n_iterations, position_probabilities, retirement_counts}
+        {type: "complete", position_probabilities, retirement_counts, n_iterations}
+    """
+    await websocket.accept()
+    
+    try:
+        # Receive simulation request
+        data = await websocket.receive_json()
+        year = data.get('year', 2024)
+        gp_name = data.get('gp_name', 'Bahrain')
+        n_iterations = data.get('n_iterations', 500)
+        drivers_data = data.get('drivers', [])
+        
+        params = load_all_fitted_parameters(year)
+        
+        driver_configs = []
+        for d in drivers_data:
+            driver_configs.append({
+                'abbreviation': d['abbreviation'],
+                'team': d['team'],
+                'grid_pos': d['grid_pos'],
+                't_car': d['t_car'],
+                't_driver': d['t_driver'],
+                'strategy': d['strategy']
+            })
+        
+        track_config = get_race_config(gp_name)
+        track_config['track_name'] = gp_name
+        simulator = RaceSimulator(track_config, params)
+        
+        n_drivers = len(driver_configs)
+        position_counts = {dc['abbreviation']: np.zeros(n_drivers + 1) for dc in driver_configs}
+        retirement_counts = {dc['abbreviation']: 0 for dc in driver_configs}
+        
+        batch_size = max(10, n_iterations // 20)  # Send ~20 progress updates
+        
+        for i in range(n_iterations):
+            # Create fresh driver states
+            drivers = []
+            for dc in driver_configs:
+                ds = DriverState(
+                    abbreviation=dc['abbreviation'],
+                    team=dc['team'],
+                    grid_pos=dc['grid_pos'],
+                    t_car=dc.get('t_car', 0.0),
+                    t_driver=dc.get('t_driver', 0.0),
+                    fisk_params=params.get('driver_fisk_params', {}).get(dc['abbreviation'], None),
+                    start_perf=params.get('driver_start_params', {}).get(dc['abbreviation'], None),
+                    strategy=dc.get('strategy', [
+                        {'lap': 1, 'compound': 'MEDIUM'},
+                        {'lap': 20, 'compound': 'HARD'}
+                    ])
+                )
+                drivers.append(ds)
+            
+            result = simulator.simulate_race(drivers, seed=42 + i)
+            
+            for r in result['results']:
+                drv = r['driver']
+                pos = r['position']
+                if pos <= n_drivers:
+                    position_counts[drv][pos] += 1
+                if r['retired']:
+                    retirement_counts[drv] += 1
+            
+            # Send progress update
+            if (i + 1) % batch_size == 0 or i == n_iterations - 1:
+                completed = i + 1
+                pos_probs = {}
+                for drv, counts in position_counts.items():
+                    pos_probs[drv] = (counts / completed).tolist()
+                
+                msg_type = "complete" if completed == n_iterations else "progress"
+                
+                await websocket.send_json({
+                    "type": msg_type,
+                    "iteration": completed,
+                    "n_iterations": n_iterations,
+                    "position_probabilities": pos_probs,
+                    "retirement_counts": {k: v for k, v in retirement_counts.items()},
+                })
+                
+                # Yield control to allow WebSocket messages to be sent
+                await asyncio.sleep(0)
+    
+    except WebSocketDisconnect:
+        print("WebSocket client disconnected")
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "detail": str(e)})
+        except:
+            pass
+
+
+@app.post("/api/simulate/rl")
+async def simulate_rl(req: RLRequest):
+    """Train an RL agent and return its recommended strategy vs the user's strategy."""
+    try:
+        from rl_environment import F1StrategyEnv, train_agent
+        
+        params = load_all_fitted_parameters(req.year)
+        track_config = get_race_config(req.gp_name)
+        track_config['track_name'] = req.gp_name
+        
+        driver_configs = []
+        agent_idx = 0
+        for i, d in enumerate(req.drivers):
+            dc = {
+                'abbreviation': d.abbreviation,
+                'team': d.team,
+                'grid_pos': d.grid_pos,
+                't_car': d.t_car,
+                't_driver': d.t_driver,
+                'strategy': [{'lap': s.lap, 'compound': s.compound} for s in d.strategy]
+            }
+            if d.abbreviation == req.driver_abbreviation:
+                agent_idx = i
+            driver_configs.append(dc)
+        
+        # Create RL environment
+        env = F1StrategyEnv(
+            race_config=track_config,
+            sim_params=params,
+            driver_configs=driver_configs,
+            agent_driver_idx=agent_idx,
+        )
+        
+        # Train the agent (limited episodes for API response time)
+        n_episodes = min(req.n_training_episodes, 5000)
+        trained_agent = train_agent(env, n_episodes=n_episodes, verbose=False)
+        
+        # Get RL-recommended strategy (average over 20 episodes)
+        rl_results = []
+        for _ in range(20):
+            result = trained_agent.get_recommended_strategy(env)
+            rl_results.append(result)
+        
+        # Aggregate RL results
+        avg_position = np.mean([r['final_position'] for r in rl_results])
+        avg_points = np.mean([r['points'] for r in rl_results])
+        retirement_rate = np.mean([1 if r['retired'] else 0 for r in rl_results])
+        
+        # Find most common strategy
+        from collections import Counter
+        strategy_strs = [str(r['strategy']) for r in rl_results]
+        most_common_strategy = Counter(strategy_strs).most_common(1)[0]
+        best_strategy_idx = strategy_strs.index(most_common_strategy[0])
+        recommended_strategy = rl_results[best_strategy_idx]['strategy']
+        
+        # Also run user's strategy through Monte Carlo for comparison
+        simulator = RaceSimulator(track_config, params)
+        mc_results = simulator.monte_carlo(driver_configs, n_iterations=100)
+        user_probs = mc_results['position_probabilities'].get(req.driver_abbreviation, np.zeros(21))
+        user_expected = sum(i * p for i, p in enumerate(user_probs))
+        user_points = sum(F1_POINTS.get(i, 0) * p for i, p in enumerate(user_probs))
+        
+        F1_POINTS_LOCAL = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
+        user_points = sum(F1_POINTS_LOCAL.get(i, 0) * float(p) for i, p in enumerate(user_probs))
+        
+        return {
+            "rl_strategy": {
+                "pit_stops": recommended_strategy,
+                "avg_position": round(avg_position, 1),
+                "avg_points": round(avg_points, 1),
+                "retirement_rate": round(retirement_rate, 3),
+                "n_training_episodes": n_episodes,
+                "n_evaluation_runs": 20,
+            },
+            "user_strategy": {
+                "expected_position": round(float(user_expected), 1),
+                "expected_points": round(float(user_points), 1),
+            },
+            "improvement": {
+                "position_delta": round(float(user_expected) - avg_position, 1),
+                "points_delta": round(avg_points - float(user_points), 1),
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+from fastapi.responses import FileResponse
+import glob
+
+@app.get("/api/assets/{filename}")
+async def get_asset(filename: str):
+    """Serve local assets (e.g. generated images) to the frontend."""
+    asset_dir = os.path.dirname(os.path.abspath(__file__))
+    # Search for files starting with the base name (handles the dynamic timestamp suffix)
+    search_pattern = os.path.join(asset_dir, f"{filename}*")
+    matched_files = glob.glob(search_pattern)
+    if matched_files:
+        return FileResponse(matched_files[0])
+    raise HTTPException(status_code=404, detail=f"Asset '{filename}' not found")
 
 
 if __name__ == "__main__":
